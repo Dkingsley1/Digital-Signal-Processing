@@ -1,0 +1,449 @@
+"""
+Dynamic range convolution reverb processor.
+
+Loads a dry WAV file and a room impulse response WAV, then overlays the room
+response using scipy.signal.fftconvolve. The optional block mode uses
+overlap-add style processing so the same algorithm can be demonstrated in a
+real-time/streaming-friendly shape.
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Tuple
+
+import numpy as np
+from scipy.io import wavfile
+from scipy.signal import fftconvolve, resample_poly
+
+
+EPSILON = 1e-9
+
+
+@dataclass(frozen=True)
+class ReverbSettings:
+    dry: float = 1.0
+    wet: float = 0.35
+    ir_gain_db: float = 0.0
+    output_gain_db: float = 0.0
+    predelay_ms: float = 0.0
+    ir_decay_t60: float = 0.0
+    max_ir_seconds: float = 0.0
+    normalize_ir: bool = True
+    trim_ir: bool = False
+    trim_threshold_db: float = -80.0
+    ducking_db: float = 0.0
+    duck_threshold_db: float = -24.0
+    duck_attack_ms: float = 10.0
+    duck_release_ms: float = 250.0
+    block_size: int = 0
+    tail_seconds: Optional[float] = None
+    fade_ms: float = 5.0
+    normalize_output: bool = True
+
+
+class DynamicRangeConvolutionReverb:
+    """FFT convolution reverb with optional dynamic wet-signal ducking."""
+
+    def __init__(self, sample_rate: int, settings: ReverbSettings):
+        self.sample_rate = sample_rate
+        self.settings = settings
+
+    def process(self, dry_audio: np.ndarray, impulse_response: np.ndarray) -> np.ndarray:
+        dry_audio = ensure_2d(dry_audio)
+        impulse_response = ensure_2d(impulse_response)
+        prepared_ir = self._prepare_impulse_response(impulse_response)
+        aligned_dry, aligned_ir = align_channels(dry_audio, prepared_ir)
+
+        if self.settings.block_size and self.settings.block_size > 0:
+            wet_audio = blockwise_fft_convolve(
+                aligned_dry,
+                aligned_ir,
+                self.settings.block_size,
+            )
+        else:
+            wet_audio = full_fft_convolve(aligned_dry, aligned_ir)
+
+        wet_audio *= self.settings.wet
+        wet_audio = apply_dynamic_ducking(
+            wet_audio,
+            aligned_dry,
+            self.sample_rate,
+            max_duck_db=self.settings.ducking_db,
+            threshold_db=self.settings.duck_threshold_db,
+            attack_ms=self.settings.duck_attack_ms,
+            release_ms=self.settings.duck_release_ms,
+        )
+
+        dry_padded = np.zeros_like(wet_audio, dtype=np.float32)
+        dry_padded[: aligned_dry.shape[0], :] = aligned_dry
+
+        output = (self.settings.dry * dry_padded) + wet_audio
+        output *= db_to_gain(self.settings.output_gain_db)
+
+        if self.settings.tail_seconds is not None:
+            output = trim_reverb_tail(
+                output,
+                dry_length=aligned_dry.shape[0],
+                sample_rate=self.sample_rate,
+                tail_seconds=self.settings.tail_seconds,
+                fade_ms=max(self.settings.fade_ms, 20.0),
+            )
+
+        output = apply_edge_fades(output, self.sample_rate, self.settings.fade_ms)
+
+        if self.settings.normalize_output:
+            output = normalize_peak(output, peak=0.98)
+
+        return output.astype(np.float32, copy=False)
+
+    def _prepare_impulse_response(self, impulse_response: np.ndarray) -> np.ndarray:
+        ir = impulse_response.astype(np.float32, copy=True)
+
+        if self.settings.trim_ir:
+            ir = trim_silence(ir, self.settings.trim_threshold_db)
+
+        if self.settings.max_ir_seconds > 0:
+            max_samples = max(1, int(round(self.settings.max_ir_seconds * self.sample_rate)))
+            ir = ir[:max_samples, :]
+
+        if self.settings.ir_decay_t60 > 0:
+            ir = apply_t60_decay(ir, self.sample_rate, self.settings.ir_decay_t60)
+
+        if self.settings.predelay_ms > 0:
+            predelay_samples = int(round(self.sample_rate * self.settings.predelay_ms / 1000.0))
+            ir = np.vstack((np.zeros((predelay_samples, ir.shape[1]), dtype=np.float32), ir))
+
+        if self.settings.normalize_ir:
+            ir = normalize_peak(ir, peak=1.0)
+
+        ir *= db_to_gain(self.settings.ir_gain_db)
+
+        if ir.shape[0] == 0:
+            raise ValueError("Impulse response is empty after preprocessing.")
+
+        return ir
+
+
+def read_wav_float(path: Path) -> Tuple[int, np.ndarray]:
+    sample_rate, data = wavfile.read(path)
+    return sample_rate, pcm_to_float(data)
+
+
+def write_wav(path: Path, sample_rate: int, audio: np.ndarray, float_output: bool) -> None:
+    audio = np.squeeze(audio, axis=1) if audio.ndim == 2 and audio.shape[1] == 1 else audio
+    audio = np.clip(audio, -1.0, 1.0)
+
+    if float_output:
+        wavfile.write(path, sample_rate, audio.astype(np.float32))
+    else:
+        wavfile.write(path, sample_rate, (audio * 32767.0).astype(np.int16))
+
+
+def pcm_to_float(data: np.ndarray) -> np.ndarray:
+    if np.issubdtype(data.dtype, np.floating):
+        return data.astype(np.float32, copy=False)
+
+    if np.issubdtype(data.dtype, np.signedinteger):
+        info = np.iinfo(data.dtype)
+        scale = float(max(abs(info.min), info.max))
+        return (data.astype(np.float32) / scale).clip(-1.0, 1.0)
+
+    if np.issubdtype(data.dtype, np.unsignedinteger):
+        info = np.iinfo(data.dtype)
+        center = (info.max + 1) / 2.0
+        return ((data.astype(np.float32) - center) / center).clip(-1.0, 1.0)
+
+    raise TypeError(f"Unsupported WAV data type: {data.dtype}")
+
+
+def ensure_2d(audio: np.ndarray) -> np.ndarray:
+    if audio.ndim == 1:
+        return audio[:, np.newaxis].astype(np.float32, copy=False)
+    if audio.ndim == 2:
+        return audio.astype(np.float32, copy=False)
+    raise ValueError(f"Expected mono or multichannel audio, got shape {audio.shape}")
+
+
+def resample_if_needed(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if source_rate == target_rate:
+        return audio
+
+    divisor = math.gcd(source_rate, target_rate)
+    up = target_rate // divisor
+    down = source_rate // divisor
+    return resample_poly(audio, up, down, axis=0).astype(np.float32)
+
+
+def align_channels(dry_audio: np.ndarray, impulse_response: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    dry_channels = dry_audio.shape[1]
+    ir_channels = impulse_response.shape[1]
+
+    if ir_channels == dry_channels:
+        return dry_audio, impulse_response
+
+    if ir_channels == 1:
+        return dry_audio, np.repeat(impulse_response, dry_channels, axis=1)
+
+    if dry_channels == 1:
+        return np.repeat(dry_audio, ir_channels, axis=1), impulse_response
+
+    raise ValueError(
+        "Input WAV and impulse response have incompatible channel counts: "
+        f"{dry_channels} and {ir_channels}. Use a mono IR, matching channel counts, "
+        "or a mono input with a stereo IR."
+    )
+
+
+def full_fft_convolve(dry_audio: np.ndarray, impulse_response: np.ndarray) -> np.ndarray:
+    output_length = dry_audio.shape[0] + impulse_response.shape[0] - 1
+    output = np.zeros((output_length, dry_audio.shape[1]), dtype=np.float32)
+
+    for channel in range(dry_audio.shape[1]):
+        output[:, channel] = fftconvolve(
+            dry_audio[:, channel],
+            impulse_response[:, channel],
+            mode="full",
+        ).astype(np.float32)
+
+    return output
+
+
+def blockwise_fft_convolve(
+    dry_audio: np.ndarray,
+    impulse_response: np.ndarray,
+    block_size: int,
+) -> np.ndarray:
+    if block_size <= 0:
+        raise ValueError("block_size must be positive for blockwise convolution.")
+
+    output_length = dry_audio.shape[0] + impulse_response.shape[0] - 1
+    output = np.zeros((output_length, dry_audio.shape[1]), dtype=np.float32)
+
+    for start in range(0, dry_audio.shape[0], block_size):
+        end = min(start + block_size, dry_audio.shape[0])
+        block = dry_audio[start:end, :]
+
+        for channel in range(dry_audio.shape[1]):
+            convolved_block = fftconvolve(
+                block[:, channel],
+                impulse_response[:, channel],
+                mode="full",
+            ).astype(np.float32)
+            output[start : start + convolved_block.shape[0], channel] += convolved_block
+
+    return output
+
+
+def apply_dynamic_ducking(
+    wet_audio: np.ndarray,
+    dry_audio: np.ndarray,
+    sample_rate: int,
+    max_duck_db: float,
+    threshold_db: float,
+    attack_ms: float,
+    release_ms: float,
+) -> np.ndarray:
+    if max_duck_db <= 0:
+        return wet_audio
+
+    sidechain = np.mean(np.abs(dry_audio), axis=1)
+    padded_sidechain = np.zeros(wet_audio.shape[0], dtype=np.float32)
+    padded_sidechain[: sidechain.shape[0]] = sidechain
+
+    envelope = envelope_follower(padded_sidechain, sample_rate, attack_ms, release_ms)
+    level_db = 20.0 * np.log10(envelope + EPSILON)
+    over_threshold = np.maximum(level_db - threshold_db, 0.0)
+    gain_reduction_db = np.minimum(over_threshold, max_duck_db)
+    gain = db_to_gain(-gain_reduction_db).astype(np.float32)
+
+    return wet_audio * gain[:, np.newaxis]
+
+
+def envelope_follower(
+    signal: np.ndarray,
+    sample_rate: int,
+    attack_ms: float,
+    release_ms: float,
+) -> np.ndarray:
+    attack_seconds = max(attack_ms / 1000.0, 1.0 / sample_rate)
+    release_seconds = max(release_ms / 1000.0, 1.0 / sample_rate)
+    attack_coeff = math.exp(-1.0 / (sample_rate * attack_seconds))
+    release_coeff = math.exp(-1.0 / (sample_rate * release_seconds))
+
+    envelope = np.zeros_like(signal, dtype=np.float32)
+    current = 0.0
+
+    for index, sample in enumerate(signal):
+        coefficient = attack_coeff if sample > current else release_coeff
+        current = (coefficient * current) + ((1.0 - coefficient) * sample)
+        envelope[index] = current
+
+    return envelope
+
+
+def trim_silence(audio: np.ndarray, threshold_db: float) -> np.ndarray:
+    threshold = db_to_gain(threshold_db)
+    mono_peak = np.max(np.abs(audio), axis=1)
+    active = np.flatnonzero(mono_peak > threshold)
+
+    if active.size == 0:
+        return audio
+
+    return audio[active[0] : active[-1] + 1, :]
+
+
+def apply_t60_decay(impulse_response: np.ndarray, sample_rate: int, t60_seconds: float) -> np.ndarray:
+    time = np.arange(impulse_response.shape[0], dtype=np.float32) / float(sample_rate)
+    envelope = np.power(10.0, -3.0 * time / t60_seconds).astype(np.float32)
+    return impulse_response * envelope[:, np.newaxis]
+
+
+def trim_reverb_tail(
+    audio: np.ndarray,
+    dry_length: int,
+    sample_rate: int,
+    tail_seconds: float,
+    fade_ms: float,
+) -> np.ndarray:
+    target_length = min(audio.shape[0], dry_length + int(round(tail_seconds * sample_rate)))
+    if target_length >= audio.shape[0]:
+        return audio
+
+    fade_length = min(int(round(fade_ms * sample_rate / 1000.0)), target_length)
+    trimmed = audio[:target_length, :].copy()
+
+    if fade_length > 1:
+        fade = np.linspace(1.0, 0.0, fade_length, dtype=np.float32)
+        trimmed[-fade_length:, :] *= fade[:, np.newaxis]
+
+    return trimmed
+
+
+def apply_edge_fades(audio: np.ndarray, sample_rate: int, fade_ms: float) -> np.ndarray:
+    fade_length = min(int(round(fade_ms * sample_rate / 1000.0)), audio.shape[0] // 2)
+    if fade_length <= 1:
+        return audio
+
+    faded = audio.copy()
+    fade_in = np.linspace(0.0, 1.0, fade_length, dtype=np.float32)
+    fade_out = np.linspace(1.0, 0.0, fade_length, dtype=np.float32)
+    faded[:fade_length, :] *= fade_in[:, np.newaxis]
+    faded[-fade_length:, :] *= fade_out[:, np.newaxis]
+    return faded
+
+
+def normalize_peak(audio: np.ndarray, peak: float = 0.98, allow_boost: bool = True) -> np.ndarray:
+    current_peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if current_peak <= EPSILON:
+        return audio
+    if not allow_boost and current_peak <= peak:
+        return audio
+    return (audio * (peak / current_peak)).astype(np.float32)
+
+
+def db_to_gain(db: np.ndarray | float) -> np.ndarray | float:
+    return np.power(10.0, np.asarray(db) / 20.0)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Apply FFT convolution reverb from a room impulse response WAV.",
+    )
+    parser.add_argument("input_wav", type=Path, help="Dry source WAV file.")
+    parser.add_argument("impulse_response_wav", type=Path, help="Room impulse response WAV file.")
+    parser.add_argument("output_wav", type=Path, help="Rendered output WAV file.")
+
+    parser.add_argument("--dry", type=float, default=1.0, help="Dry signal gain. Default: 1.0")
+    parser.add_argument("--wet", type=float, default=0.35, help="Wet reverb gain. Default: 0.35")
+    parser.add_argument("--ir-gain-db", type=float, default=0.0, help="Gain applied to the impulse response.")
+    parser.add_argument("--output-gain-db", type=float, default=0.0, help="Final output gain.")
+    parser.add_argument("--predelay-ms", type=float, default=0.0, help="Delay before the reverb starts.")
+    parser.add_argument("--ir-decay-t60", type=float, default=0.0, help="Optional IR decay time in seconds.")
+    parser.add_argument("--max-ir-seconds", type=float, default=0.0, help="Trim IR to this duration before processing.")
+    parser.add_argument("--trim-ir", action="store_true", help="Trim leading/trailing silence from the IR.")
+    parser.add_argument("--trim-threshold-db", type=float, default=-80.0, help="Silence threshold for --trim-ir.")
+    parser.add_argument("--no-ir-normalize", action="store_false", dest="normalize_ir", help="Preserve original IR level.")
+
+    parser.add_argument("--ducking-db", type=float, default=0.0, help="Maximum dynamic wet-signal reduction.")
+    parser.add_argument("--duck-threshold-db", type=float, default=-24.0, help="Dry level that starts ducking.")
+    parser.add_argument("--duck-attack-ms", type=float, default=10.0, help="Ducking attack time.")
+    parser.add_argument("--duck-release-ms", type=float, default=250.0, help="Ducking release time.")
+
+    parser.add_argument("--block-size", type=int, default=0, help="Use overlap-add FFT blocks, e.g. 8192.")
+    parser.add_argument("--tail-seconds", type=float, default=None, help="Limit rendered reverb tail after dry audio.")
+    parser.add_argument("--fade-ms", type=float, default=5.0, help="Short edge fade to prevent clicks.")
+    parser.add_argument("--no-normalize", action="store_false", dest="normalize_output", help="Disable peak normalization.")
+    parser.add_argument("--float-output", action="store_true", help="Write 32-bit float WAV instead of 16-bit PCM.")
+    parser.set_defaults(normalize_ir=True, normalize_output=True)
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.dry < 0 or args.wet < 0:
+        raise ValueError("--dry and --wet must be non-negative.")
+    if args.predelay_ms < 0 or args.ir_decay_t60 < 0 or args.max_ir_seconds < 0:
+        raise ValueError("Timing values must be non-negative.")
+    if args.block_size < 0:
+        raise ValueError("--block-size must be zero or a positive integer.")
+    if args.tail_seconds is not None and args.tail_seconds < 0:
+        raise ValueError("--tail-seconds must be non-negative.")
+    if args.fade_ms < 0:
+        raise ValueError("--fade-ms must be non-negative.")
+    if args.duck_attack_ms < 0 or args.duck_release_ms < 0:
+        raise ValueError("Ducking attack/release must be non-negative.")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(args)
+
+    input_rate, dry_audio = read_wav_float(args.input_wav)
+    ir_rate, impulse_response = read_wav_float(args.impulse_response_wav)
+    impulse_response = resample_if_needed(impulse_response, ir_rate, input_rate)
+
+    settings = ReverbSettings(
+        dry=args.dry,
+        wet=args.wet,
+        ir_gain_db=args.ir_gain_db,
+        output_gain_db=args.output_gain_db,
+        predelay_ms=args.predelay_ms,
+        ir_decay_t60=args.ir_decay_t60,
+        max_ir_seconds=args.max_ir_seconds,
+        normalize_ir=args.normalize_ir,
+        trim_ir=args.trim_ir,
+        trim_threshold_db=args.trim_threshold_db,
+        ducking_db=args.ducking_db,
+        duck_threshold_db=args.duck_threshold_db,
+        duck_attack_ms=args.duck_attack_ms,
+        duck_release_ms=args.duck_release_ms,
+        block_size=args.block_size,
+        tail_seconds=args.tail_seconds,
+        fade_ms=args.fade_ms,
+        normalize_output=args.normalize_output,
+    )
+
+    processor = DynamicRangeConvolutionReverb(input_rate, settings)
+    output = processor.process(dry_audio, impulse_response)
+
+    args.output_wav.parent.mkdir(parents=True, exist_ok=True)
+    write_wav(args.output_wav, input_rate, output, args.float_output)
+
+    dry_seconds = dry_audio.shape[0] / input_rate
+    output_seconds = output.shape[0] / input_rate
+    channels = output.shape[1] if output.ndim == 2 else 1
+
+    print(f"Rendered: {args.output_wav}")
+    print(f"Sample rate: {input_rate} Hz")
+    print(f"Channels: {channels}")
+    print(f"Dry length: {dry_seconds:.2f}s")
+    print(f"Output length with reverb tail: {output_seconds:.2f}s")
+    print(f"Convolution mode: {'blockwise fftconvolve' if args.block_size else 'full fftconvolve'}")
+
+
+if __name__ == "__main__":
+    main()
