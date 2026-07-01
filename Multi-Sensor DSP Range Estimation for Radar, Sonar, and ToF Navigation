@@ -1,0 +1,586 @@
+#!/usr/bin/env python3
+"""
+Multi-sensor DSP range estimation for radar, sonar, and optical ToF navigation.
+
+This project simulates emitted waveforms, noisy echoes, matched-filter range
+estimation, sensor fusion, and a simple obstacle-avoidance recommendation.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+
+SPEED_OF_LIGHT_MPS = 299_792_458.0
+SPEED_OF_SOUND_MPS = 343.0
+EPSILON = 1e-12
+
+
+@dataclass(frozen=True)
+class SensorConfig:
+    name: str
+    propagation_speed_mps: float
+    sample_rate_hz: float
+    waveform: str
+    pulse_seconds: float
+    bandwidth_hz: float
+    max_range_m: float
+    beam_width_deg: float
+    noise_std: float
+    min_snr_db: float
+    description: str
+
+
+@dataclass(frozen=True)
+class Target:
+    x_m: float
+    y_m: float
+    reflectivity: float
+    label: str
+
+    @property
+    def range_m(self) -> float:
+        return math.hypot(self.x_m, self.y_m)
+
+    @property
+    def bearing_deg(self) -> float:
+        return math.degrees(math.atan2(self.y_m, self.x_m))
+
+
+@dataclass
+class Detection:
+    sensor: str
+    bearing_deg: float
+    detected: bool
+    estimated_range_m: float
+    true_range_m: Optional[float]
+    range_error_m: Optional[float]
+    snr_db: float
+    peak_value: float
+    x_m: Optional[float]
+    y_m: Optional[float]
+
+
+@dataclass(frozen=True)
+class NavigationDecision:
+    recommended_bearing_deg: float
+    estimated_clearance_m: float
+    steering_text: str
+    nearest_front_obstacle_m: Optional[float]
+
+
+def default_sensor_configs() -> dict[str, SensorConfig]:
+    return {
+        "radar": SensorConfig(
+            name="radar",
+            propagation_speed_mps=SPEED_OF_LIGHT_MPS,
+            sample_rate_hz=200_000_000.0,
+            waveform="chirp",
+            pulse_seconds=0.30e-6,
+            bandwidth_hz=60_000_000.0,
+            max_range_m=80.0,
+            beam_width_deg=7.5,
+            noise_std=0.018,
+            min_snr_db=11.0,
+            description="Pulse-compression radar chirp for medium-range obstacle sensing.",
+        ),
+        "sonar": SensorConfig(
+            name="sonar",
+            propagation_speed_mps=SPEED_OF_SOUND_MPS,
+            sample_rate_hz=48_000.0,
+            waveform="chirp",
+            pulse_seconds=0.020,
+            bandwidth_hz=16_000.0,
+            max_range_m=25.0,
+            beam_width_deg=14.0,
+            noise_std=0.030,
+            min_snr_db=10.0,
+            description="Acoustic chirp sonar for short-range navigation and backup sensing.",
+        ),
+        "tof": SensorConfig(
+            name="tof",
+            propagation_speed_mps=SPEED_OF_LIGHT_MPS,
+            sample_rate_hz=500_000_000.0,
+            waveform="gaussian",
+            pulse_seconds=40e-9,
+            bandwidth_hz=0.0,
+            max_range_m=40.0,
+            beam_width_deg=4.5,
+            noise_std=0.012,
+            min_snr_db=10.5,
+            description="Optical time-of-flight pulse for close, precise range estimation.",
+        ),
+    }
+
+
+def default_scene() -> list[Target]:
+    return [
+        Target(7.5, -3.0, 0.95, "low crate"),
+        Target(11.8, 1.4, 0.90, "front obstacle"),
+        Target(15.5, 6.0, 0.75, "right wall edge"),
+        Target(21.0, -6.5, 0.70, "left barrier"),
+        Target(31.5, 8.0, 0.55, "far marker"),
+        Target(5.3, 4.2, 0.65, "near side object"),
+    ]
+
+
+def make_waveform(config: SensorConfig) -> np.ndarray:
+    sample_count = max(8, int(round(config.sample_rate_hz * config.pulse_seconds)))
+    time = np.arange(sample_count, dtype=np.float64) / config.sample_rate_hz
+
+    if config.waveform == "gaussian":
+        center = 0.5 * config.pulse_seconds
+        width = max(config.pulse_seconds / 7.0, 1.0 / config.sample_rate_hz)
+        pulse = np.exp(-0.5 * np.square((time - center) / width))
+        pulse -= np.mean(pulse)
+        return normalize_energy(pulse)
+
+    chirp_rate = config.bandwidth_hz / max(config.pulse_seconds, EPSILON)
+    phase = 2.0 * np.pi * ((-0.5 * config.bandwidth_hz) * time + 0.5 * chirp_rate * np.square(time))
+    window = np.hanning(sample_count)
+    chirp = np.cos(phase) * window
+    return normalize_energy(chirp)
+
+
+def normalize_energy(signal: np.ndarray) -> np.ndarray:
+    energy = math.sqrt(float(np.sum(np.square(signal))))
+    if energy <= EPSILON:
+        return signal.astype(np.float64)
+    return (signal / energy).astype(np.float64)
+
+
+def simulate_received_signal(
+    config: SensorConfig,
+    waveform: np.ndarray,
+    targets: list[Target],
+    bearing_deg: float,
+    rng: np.random.Generator,
+    clutter_count: int,
+    multipath_strength: float,
+) -> tuple[np.ndarray, Optional[float]]:
+    max_delay_seconds = 2.0 * config.max_range_m / config.propagation_speed_mps
+    record_seconds = max_delay_seconds + (2.5 * config.pulse_seconds)
+    record_samples = int(math.ceil(record_seconds * config.sample_rate_hz)) + waveform.size + 4
+    received = rng.normal(0.0, config.noise_std, record_samples).astype(np.float64)
+
+    visible_targets = targets_in_beam(targets, bearing_deg, config.beam_width_deg, config.max_range_m)
+    true_nearest = min((target.range_m for target in visible_targets), default=None)
+
+    for target in visible_targets:
+        add_target_echo(received, waveform, config, target.range_m, target.reflectivity, target.bearing_deg, bearing_deg)
+
+        if multipath_strength > 0:
+            ghost_range = target.range_m * rng.uniform(1.16, 1.34)
+            if ghost_range <= config.max_range_m:
+                add_target_echo(
+                    received,
+                    waveform,
+                    config,
+                    ghost_range,
+                    target.reflectivity * multipath_strength,
+                    target.bearing_deg,
+                    bearing_deg,
+                )
+
+    add_clutter_echoes(received, waveform, config, rng, clutter_count)
+    return received, true_nearest
+
+
+def targets_in_beam(
+    targets: list[Target],
+    bearing_deg: float,
+    beam_width_deg: float,
+    max_range_m: float,
+) -> list[Target]:
+    half_width = beam_width_deg / 2.0
+    in_beam = []
+
+    for target in targets:
+        if target.range_m > max_range_m:
+            continue
+        if abs(wrap_angle_deg(target.bearing_deg - bearing_deg)) <= half_width:
+            in_beam.append(target)
+
+    return in_beam
+
+
+def add_target_echo(
+    received: np.ndarray,
+    waveform: np.ndarray,
+    config: SensorConfig,
+    range_m: float,
+    reflectivity: float,
+    target_bearing_deg: float,
+    beam_bearing_deg: float,
+) -> None:
+    delay_seconds = 2.0 * range_m / config.propagation_speed_mps
+    delay_samples = int(round(delay_seconds * config.sample_rate_hz))
+    end = delay_samples + waveform.size
+
+    if delay_samples < 0 or end > received.size:
+        return
+
+    angle_error = abs(wrap_angle_deg(target_bearing_deg - beam_bearing_deg))
+    beam_gain = max(math.cos(math.radians(angle_error)), 0.0) ** 2
+    spreading_loss = 1.0 / (1.0 + 0.025 * range_m * range_m)
+    amplitude = reflectivity * beam_gain * spreading_loss
+    received[delay_samples:end] += amplitude * waveform
+
+
+def add_clutter_echoes(
+    received: np.ndarray,
+    waveform: np.ndarray,
+    config: SensorConfig,
+    rng: np.random.Generator,
+    clutter_count: int,
+) -> None:
+    if clutter_count <= 0:
+        return
+
+    max_delay_seconds = 2.0 * config.max_range_m / config.propagation_speed_mps
+    max_delay_samples = int(max_delay_seconds * config.sample_rate_hz)
+
+    for _ in range(clutter_count):
+        delay_samples = int(rng.integers(0, max(1, max_delay_samples)))
+        end = delay_samples + waveform.size
+        if end > received.size:
+            continue
+        amplitude = rng.uniform(0.01, 0.06)
+        received[delay_samples:end] += amplitude * waveform
+
+
+def matched_filter_detect(
+    config: SensorConfig,
+    waveform: np.ndarray,
+    received: np.ndarray,
+    bearing_deg: float,
+    true_range_m: Optional[float],
+) -> Detection:
+    correlation = fft_convolve(received, waveform[::-1])
+    valid = correlation[waveform.size - 1 :]
+    max_delay_samples = int(round((2.0 * config.max_range_m / config.propagation_speed_mps) * config.sample_rate_hz))
+    valid = valid[: max(1, min(max_delay_samples + 1, valid.size))]
+
+    magnitude = np.abs(valid)
+    peak_index = int(np.argmax(magnitude))
+    peak_value = float(magnitude[peak_index])
+    noise_floor = robust_noise_floor(magnitude)
+    snr_db = 20.0 * math.log10((peak_value + EPSILON) / (noise_floor + EPSILON))
+    detected = snr_db >= config.min_snr_db
+
+    estimated_range_m = (peak_index / config.sample_rate_hz) * config.propagation_speed_mps / 2.0
+    if not detected:
+        estimated_range_m = config.max_range_m
+
+    x_m = estimated_range_m * math.cos(math.radians(bearing_deg)) if detected else None
+    y_m = estimated_range_m * math.sin(math.radians(bearing_deg)) if detected else None
+    range_error_m = estimated_range_m - true_range_m if detected and true_range_m is not None else None
+
+    return Detection(
+        sensor=config.name,
+        bearing_deg=bearing_deg,
+        detected=detected,
+        estimated_range_m=estimated_range_m,
+        true_range_m=true_range_m,
+        range_error_m=range_error_m,
+        snr_db=snr_db,
+        peak_value=peak_value,
+        x_m=x_m,
+        y_m=y_m,
+    )
+
+
+def fft_convolve(signal: np.ndarray, kernel: np.ndarray) -> np.ndarray:
+    output_size = signal.size + kernel.size - 1
+    fft_size = 1 << (output_size - 1).bit_length()
+    spectrum_a = np.fft.rfft(signal, fft_size)
+    spectrum_b = np.fft.rfft(kernel, fft_size)
+    return np.fft.irfft(spectrum_a * spectrum_b, fft_size)[:output_size]
+
+
+def robust_noise_floor(values: np.ndarray) -> float:
+    median = float(np.median(values))
+    mad = float(np.median(np.abs(values - median)))
+    return median + (1.4826 * mad) + EPSILON
+
+
+def run_sensor_scan(
+    config: SensorConfig,
+    targets: list[Target],
+    bearings: np.ndarray,
+    seed: int,
+    clutter_count: int,
+    multipath_strength: float,
+) -> list[Detection]:
+    rng = np.random.default_rng(seed + stable_sensor_offset(config.name))
+    waveform = make_waveform(config)
+    detections = []
+
+    for bearing_deg in bearings:
+        received, true_nearest = simulate_received_signal(
+            config,
+            waveform,
+            targets,
+            float(bearing_deg),
+            rng,
+            clutter_count,
+            multipath_strength,
+        )
+        detection = matched_filter_detect(config, waveform, received, float(bearing_deg), true_nearest)
+        detections.append(detection)
+
+    return detections
+
+
+def stable_sensor_offset(sensor_name: str) -> int:
+    return sum((index + 1) * ord(character) for index, character in enumerate(sensor_name))
+
+
+def fuse_detections(
+    detections: list[Detection],
+    bearings: np.ndarray,
+    max_range_m: float,
+) -> dict[float, float]:
+    fused = {float(bearing): max_range_m for bearing in bearings}
+
+    for detection in detections:
+        current = fused[detection.bearing_deg]
+        if detection.detected:
+            fused[detection.bearing_deg] = min(current, detection.estimated_range_m)
+
+    return fused
+
+
+def make_navigation_decision(fused_ranges: dict[float, float], forward_limit_deg: float = 55.0) -> NavigationDecision:
+    candidates = {
+        bearing: range_m
+        for bearing, range_m in fused_ranges.items()
+        if abs(bearing) <= forward_limit_deg
+    }
+
+    if not candidates:
+        return NavigationDecision(0.0, 0.0, "No valid forward scan available.", None)
+
+    def score(item: tuple[float, float]) -> float:
+        bearing, range_m = item
+        center_penalty = 0.045 * abs(bearing)
+        return range_m - center_penalty
+
+    recommended_bearing, clearance = max(candidates.items(), key=score)
+    front_ranges = [range_m for bearing, range_m in candidates.items() if abs(bearing) <= 12.0]
+    nearest_front = min(front_ranges) if front_ranges else None
+
+    if abs(recommended_bearing) < 6.0:
+        steering = "Continue straight."
+    elif recommended_bearing > 0:
+        steering = f"Steer right toward {recommended_bearing:.1f} degrees."
+    else:
+        steering = f"Steer left toward {abs(recommended_bearing):.1f} degrees."
+
+    return NavigationDecision(
+        recommended_bearing_deg=float(recommended_bearing),
+        estimated_clearance_m=float(clearance),
+        steering_text=steering,
+        nearest_front_obstacle_m=float(nearest_front) if nearest_front is not None else None,
+    )
+
+
+def write_scan_csv(path: Path, detections: list[Detection]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "sensor",
+                "bearing_deg",
+                "detected",
+                "estimated_range_m",
+                "true_range_m",
+                "range_error_m",
+                "snr_db",
+                "peak_value",
+                "estimated_x_m",
+                "estimated_y_m",
+            ]
+        )
+
+        for detection in detections:
+            writer.writerow(
+                [
+                    detection.sensor,
+                    f"{detection.bearing_deg:.4f}",
+                    int(detection.detected),
+                    f"{detection.estimated_range_m:.6f}",
+                    format_optional(detection.true_range_m),
+                    format_optional(detection.range_error_m),
+                    f"{detection.snr_db:.4f}",
+                    f"{detection.peak_value:.8f}",
+                    format_optional(detection.x_m),
+                    format_optional(detection.y_m),
+                ]
+            )
+
+
+def write_navigation_summary(
+    path: Path,
+    decision: NavigationDecision,
+    sensors: list[SensorConfig],
+    targets: list[Target],
+    detections: list[Detection],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    detected_count = sum(1 for detection in detections if detection.detected)
+
+    lines = [
+        "Multi-Sensor ToF DSP Navigation Summary",
+        "",
+        f"Sensors: {', '.join(sensor.name for sensor in sensors)}",
+        f"Detections: {detected_count} / {len(detections)} scan bins",
+        f"Recommended bearing: {decision.recommended_bearing_deg:.2f} deg",
+        f"Estimated clearance: {decision.estimated_clearance_m:.2f} m",
+        f"Steering recommendation: {decision.steering_text}",
+    ]
+
+    if decision.nearest_front_obstacle_m is not None:
+        lines.append(f"Nearest front obstacle: {decision.nearest_front_obstacle_m:.2f} m")
+
+    lines.extend(["", "Simulated targets:"])
+    for target in targets:
+        lines.append(
+            f"- {target.label}: x={target.x_m:.2f} m, y={target.y_m:.2f} m, "
+            f"range={target.range_m:.2f} m, bearing={target.bearing_deg:.2f} deg"
+        )
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def maybe_plot_results(
+    plot_path: Optional[Path],
+    targets: list[Target],
+    detections: list[Detection],
+    decision: NavigationDecision,
+) -> None:
+    if plot_path is None:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for --plot. Install requirements.txt first.") from exc
+
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    plt.figure(figsize=(9, 7))
+    colors = {"radar": "#0077B6", "sonar": "#CA6702", "tof": "#2A9D8F"}
+
+    for sensor in sorted({detection.sensor for detection in detections}):
+        xs = [detection.x_m for detection in detections if detection.sensor == sensor and detection.detected]
+        ys = [detection.y_m for detection in detections if detection.sensor == sensor and detection.detected]
+        plt.scatter(xs, ys, s=22, alpha=0.75, color=colors.get(sensor, "#555555"), label=f"{sensor} detections")
+
+    plt.scatter([target.x_m for target in targets], [target.y_m for target in targets], c="#D62828", marker="x", s=90, label="true targets")
+    arrow_length = min(max(decision.estimated_clearance_m, 4.0), 18.0)
+    theta = math.radians(decision.recommended_bearing_deg)
+    plt.arrow(0, 0, arrow_length * math.cos(theta), arrow_length * math.sin(theta), width=0.08, color="#111111", label="recommended path")
+    plt.scatter([0], [0], c="#111111", s=70, label="vehicle")
+    plt.axhline(0, color="#CCCCCC", linewidth=0.8)
+    plt.axvline(0, color="#CCCCCC", linewidth=0.8)
+    plt.title("Radar / Sonar / ToF DSP Range Map")
+    plt.xlabel("Forward distance (m)")
+    plt.ylabel("Lateral distance (m)")
+    plt.grid(True, alpha=0.25)
+    plt.axis("equal")
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=160)
+    plt.close()
+
+
+def format_optional(value: Optional[float]) -> str:
+    return "" if value is None else f"{value:.6f}"
+
+
+def wrap_angle_deg(angle_deg: float) -> float:
+    return ((angle_deg + 180.0) % 360.0) - 180.0
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Simulate radar, sonar, and optical ToF DSP range estimation for autonomous navigation.",
+    )
+    parser.add_argument("--sensor", choices=["all", "radar", "sonar", "tof"], default="all")
+    parser.add_argument("--output-csv", type=Path, default=Path("outputs/multisensor_scan.csv"))
+    parser.add_argument("--summary", type=Path, default=Path("outputs/navigation_summary.txt"))
+    parser.add_argument("--plot", type=Path, default=None)
+    parser.add_argument("--bearing-start", type=float, default=-75.0)
+    parser.add_argument("--bearing-stop", type=float, default=75.0)
+    parser.add_argument("--bearing-step", type=float, default=2.5)
+    parser.add_argument("--seed", type=int, default=21)
+    parser.add_argument("--clutter-count", type=int, default=0)
+    parser.add_argument("--multipath-strength", type=float, default=0.12)
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.bearing_step <= 0:
+        raise ValueError("--bearing-step must be positive.")
+    if args.bearing_stop <= args.bearing_start:
+        raise ValueError("--bearing-stop must be greater than --bearing-start.")
+    if args.clutter_count < 0:
+        raise ValueError("--clutter-count must be non-negative.")
+    if args.multipath_strength < 0:
+        raise ValueError("--multipath-strength must be non-negative.")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(args)
+
+    configs = default_sensor_configs()
+    sensors = list(configs.values()) if args.sensor == "all" else [configs[args.sensor]]
+    targets = default_scene()
+    bearings = np.arange(args.bearing_start, args.bearing_stop + (0.5 * args.bearing_step), args.bearing_step)
+
+    all_detections: list[Detection] = []
+    for sensor in sensors:
+        detections = run_sensor_scan(
+            sensor,
+            targets,
+            bearings,
+            args.seed,
+            args.clutter_count,
+            args.multipath_strength,
+        )
+        all_detections.extend(detections)
+
+    fusion_max_range = max(sensor.max_range_m for sensor in sensors)
+    fused_ranges = fuse_detections(all_detections, bearings, fusion_max_range)
+    decision = make_navigation_decision(fused_ranges)
+
+    write_scan_csv(args.output_csv, all_detections)
+    write_navigation_summary(args.summary, decision, sensors, targets, all_detections)
+    maybe_plot_results(args.plot, targets, all_detections, decision)
+
+    print(f"Scan CSV: {args.output_csv}")
+    print(f"Summary: {args.summary}")
+    print(f"Sensors: {', '.join(sensor.name for sensor in sensors)}")
+    print(f"Scan bins: {bearings.size}")
+    print(f"Detections: {sum(1 for detection in all_detections if detection.detected)} / {len(all_detections)}")
+    print(f"Recommended bearing: {decision.recommended_bearing_deg:.2f} deg")
+    print(f"Estimated clearance: {decision.estimated_clearance_m:.2f} m")
+    print(f"Steering: {decision.steering_text}")
+
+    if args.plot:
+        print(f"Plot: {args.plot}")
+
+
+if __name__ == "__main__":
+    main()
