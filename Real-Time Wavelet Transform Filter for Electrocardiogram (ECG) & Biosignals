@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+"""
+Real-time-style wavelet transform filter for ECG and biosignals.
+
+The processor loads CSV biosignal data, filters it block by block, and writes a
+new CSV with the filtered signal. It uses PyWavelets when available and falls
+back to a built-in Haar DWT implementation for lightweight demos.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+
+try:
+    import pywt
+except ImportError:  # pragma: no cover - exercised when PyWavelets is absent.
+    pywt = None
+
+
+EPSILON = 1e-12
+
+
+@dataclass(frozen=True)
+class WaveletFilterSettings:
+    sample_rate: float = 250.0
+    wavelet: str = "db6"
+    level: int = 5
+    window_seconds: float = 2.0
+    block_seconds: float = 0.25
+    threshold_scale: float = 0.85
+    threshold_mode: str = "soft"
+    baseline_correction: bool = True
+
+    @property
+    def window_samples(self) -> int:
+        return max(16, int(round(self.window_seconds * self.sample_rate)))
+
+    @property
+    def block_samples(self) -> int:
+        return max(1, int(round(self.block_seconds * self.sample_rate)))
+
+
+@dataclass
+class BiosignalData:
+    time_seconds: np.ndarray
+    signal: np.ndarray
+    sample_rate: float
+    headers: list[str]
+    columns: dict[str, np.ndarray]
+    value_column: str
+
+
+class RealTimeWaveletECGFilter:
+    """Streaming-style DWT denoiser with a rolling analysis window."""
+
+    def __init__(self, settings: WaveletFilterSettings):
+        self.settings = settings
+        self.history = np.empty(0, dtype=np.float64)
+
+    def process_block(self, block: np.ndarray) -> np.ndarray:
+        block = sanitize_signal(block)
+        combined = np.concatenate((self.history, block))
+
+        if combined.size < 8:
+            filtered = combined.copy()
+        else:
+            filtered = wavelet_denoise(combined, self.settings)
+
+        output = filtered[-block.size :]
+        self.history = combined[-self.settings.window_samples :]
+        return output
+
+    def process_signal(self, signal: np.ndarray) -> np.ndarray:
+        signal = sanitize_signal(signal)
+        output = np.zeros_like(signal, dtype=np.float64)
+        block_size = self.settings.block_samples
+
+        for start in range(0, signal.size, block_size):
+            end = min(start + block_size, signal.size)
+            output[start:end] = self.process_block(signal[start:end])
+
+        return output
+
+
+def wavelet_denoise(signal: np.ndarray, settings: WaveletFilterSettings) -> np.ndarray:
+    if pywt is not None:
+        return pywavelets_denoise(signal, settings)
+    return haar_denoise(signal, settings)
+
+
+def pywavelets_denoise(signal: np.ndarray, settings: WaveletFilterSettings) -> np.ndarray:
+    level = min(settings.level, pywt.dwt_max_level(signal.size, pywt.Wavelet(settings.wavelet).dec_len))
+    level = max(1, level)
+
+    coeffs = pywt.wavedec(signal, settings.wavelet, mode="symmetric", level=level)
+    details = coeffs[1:]
+    sigma = estimate_noise_sigma(details[-1])
+    threshold = settings.threshold_scale * sigma * math.sqrt(2.0 * math.log(max(signal.size, 2)))
+
+    denoised_coeffs = [coeffs[0]]
+    denoised_coeffs.extend(pywt.threshold(detail, threshold, mode=settings.threshold_mode) for detail in details)
+    denoised = pywt.waverec(denoised_coeffs, settings.wavelet, mode="symmetric")[: signal.size]
+
+    if settings.baseline_correction:
+        baseline_coeffs = [coeffs[0]] + [np.zeros_like(detail) for detail in details]
+        baseline = pywt.waverec(baseline_coeffs, settings.wavelet, mode="symmetric")[: signal.size]
+        denoised = denoised - baseline + np.median(baseline)
+
+    return denoised.astype(np.float64, copy=False)
+
+
+def haar_denoise(signal: np.ndarray, settings: WaveletFilterSettings) -> np.ndarray:
+    level = max(1, min(settings.level, int(math.floor(math.log2(max(signal.size, 2)))) - 1))
+    approximation, details, lengths = haar_wavedec(signal, level)
+
+    sigma = estimate_noise_sigma(details[0])
+    threshold = settings.threshold_scale * sigma * math.sqrt(2.0 * math.log(max(signal.size, 2)))
+    thresholded_details = [threshold_coefficients(detail, threshold, settings.threshold_mode) for detail in details]
+    denoised = haar_waverec(approximation, thresholded_details, lengths)[: signal.size]
+
+    if settings.baseline_correction:
+        zero_details = [np.zeros_like(detail) for detail in details]
+        baseline = haar_waverec(approximation, zero_details, lengths)[: signal.size]
+        denoised = denoised - baseline + np.median(baseline)
+
+    return denoised.astype(np.float64, copy=False)
+
+
+def haar_wavedec(signal: np.ndarray, level: int) -> tuple[np.ndarray, list[np.ndarray], list[int]]:
+    current = signal.astype(np.float64, copy=True)
+    details: list[np.ndarray] = []
+    lengths: list[int] = []
+    root_two = math.sqrt(2.0)
+
+    for _ in range(level):
+        lengths.append(current.size)
+        if current.size % 2:
+            current = np.append(current, current[-1])
+
+        even = current[0::2]
+        odd = current[1::2]
+        approximation = (even + odd) / root_two
+        detail = (even - odd) / root_two
+        details.append(detail)
+        current = approximation
+
+    return current, details, lengths
+
+
+def haar_waverec(approximation: np.ndarray, details: list[np.ndarray], lengths: list[int]) -> np.ndarray:
+    current = approximation.astype(np.float64, copy=True)
+    root_two = math.sqrt(2.0)
+
+    for detail, original_length in reversed(list(zip(details, lengths))):
+        even = (current + detail) / root_two
+        odd = (current - detail) / root_two
+        reconstructed = np.empty(even.size + odd.size, dtype=np.float64)
+        reconstructed[0::2] = even
+        reconstructed[1::2] = odd
+        current = reconstructed[:original_length]
+
+    return current
+
+
+def estimate_noise_sigma(detail_coefficients: np.ndarray) -> float:
+    median_abs = np.median(np.abs(detail_coefficients - np.median(detail_coefficients)))
+    return float(median_abs / 0.6745) if median_abs > EPSILON else 0.0
+
+
+def threshold_coefficients(coefficients: np.ndarray, threshold: float, mode: str) -> np.ndarray:
+    if threshold <= EPSILON:
+        return coefficients
+    if mode == "hard":
+        return coefficients * (np.abs(coefficients) >= threshold)
+    return np.sign(coefficients) * np.maximum(np.abs(coefficients) - threshold, 0.0)
+
+
+def sanitize_signal(signal: np.ndarray) -> np.ndarray:
+    signal = np.asarray(signal, dtype=np.float64)
+    if np.all(np.isfinite(signal)):
+        return signal
+
+    clean = signal.copy()
+    finite = np.isfinite(clean)
+    if not np.any(finite):
+        return np.zeros_like(clean)
+
+    indices = np.arange(clean.size)
+    clean[~finite] = np.interp(indices[~finite], indices[finite], clean[finite])
+    return clean
+
+
+def load_biosignal_csv(
+    path: Path,
+    sample_rate: Optional[float],
+    value_column: Optional[str],
+    time_column: Optional[str],
+) -> BiosignalData:
+    has_header = csv_has_header(path)
+
+    if has_header:
+        raw = np.genfromtxt(path, delimiter=",", names=True, dtype=float, encoding="utf-8")
+        headers = list(raw.dtype.names or [])
+        columns = {name: np.asarray(raw[name], dtype=np.float64) for name in headers}
+    else:
+        raw_array = np.genfromtxt(path, delimiter=",", dtype=float)
+        if raw_array.ndim == 1:
+            raw_array = raw_array[:, np.newaxis]
+        headers = [f"column_{index}" for index in range(raw_array.shape[1])]
+        columns = {name: raw_array[:, index].astype(np.float64) for index, name in enumerate(headers)}
+
+    if not columns:
+        raise ValueError(f"No numeric data found in {path}")
+
+    value_name = value_column or infer_value_column(headers)
+    if value_name not in columns:
+        raise ValueError(f"Value column '{value_name}' not found. Available columns: {', '.join(headers)}")
+
+    inferred_time_column = time_column or infer_time_column(headers)
+    if inferred_time_column and inferred_time_column in columns:
+        time_seconds = columns[inferred_time_column]
+        inferred_rate = infer_sample_rate(time_seconds)
+        final_sample_rate = sample_rate or inferred_rate
+    else:
+        final_sample_rate = sample_rate or 250.0
+        time_seconds = np.arange(columns[value_name].size, dtype=np.float64) / final_sample_rate
+
+    return BiosignalData(
+        time_seconds=time_seconds,
+        signal=columns[value_name],
+        sample_rate=float(final_sample_rate),
+        headers=headers,
+        columns=columns,
+        value_column=value_name,
+    )
+
+
+def csv_has_header(path: Path) -> bool:
+    first_line = path.read_text(encoding="utf-8").splitlines()[0]
+    tokens = [token.strip() for token in first_line.split(",")]
+    return any(not is_float(token) for token in tokens)
+
+
+def is_float(value: str) -> bool:
+    try:
+        float(value)
+    except ValueError:
+        return False
+    return True
+
+
+def infer_value_column(headers: list[str]) -> str:
+    preferred = ["ecg", "noisy_ecg", "signal", "value", "biosignal", "emg"]
+    lowered = {header.lower(): header for header in headers}
+
+    for name in preferred:
+        if name in lowered:
+            return lowered[name]
+
+    non_time_headers = [header for header in headers if "time" not in header.lower() and header.lower() != "t"]
+    return non_time_headers[0] if non_time_headers else headers[-1]
+
+
+def infer_time_column(headers: list[str]) -> Optional[str]:
+    for header in headers:
+        lowered = header.lower()
+        if lowered in {"time", "time_seconds", "seconds", "t"}:
+            return header
+    return None
+
+
+def infer_sample_rate(time_seconds: np.ndarray) -> float:
+    diffs = np.diff(time_seconds)
+    diffs = diffs[np.isfinite(diffs) & (diffs > EPSILON)]
+    if diffs.size == 0:
+        return 250.0
+    return float(1.0 / np.median(diffs))
+
+
+def write_output_csv(path: Path, data: BiosignalData, filtered_signal: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(["time_seconds", "raw_signal", "filtered_signal"])
+        for time_value, raw_value, filtered_value in zip(data.time_seconds, data.signal, filtered_signal):
+            writer.writerow([f"{time_value:.8f}", f"{raw_value:.10f}", f"{filtered_value:.10f}"])
+
+
+def maybe_write_plot(
+    plot_path: Optional[Path],
+    data: BiosignalData,
+    filtered_signal: np.ndarray,
+    reference_column: Optional[str],
+) -> None:
+    if plot_path is None:
+        return
+
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError as exc:
+        raise RuntimeError("matplotlib is required for --plot. Install requirements.txt first.") from exc
+
+    plot_path.parent.mkdir(parents=True, exist_ok=True)
+    time_seconds = data.time_seconds
+
+    plt.figure(figsize=(12, 7))
+    plt.plot(time_seconds, data.signal, color="#9AA5B1", linewidth=0.9, label="Raw signal")
+    plt.plot(time_seconds, filtered_signal, color="#005F73", linewidth=1.25, label="Wavelet filtered")
+
+    if reference_column and reference_column in data.columns:
+        plt.plot(time_seconds, data.columns[reference_column], color="#CA6702", linewidth=1.0, alpha=0.85, label="Reference")
+
+    plt.title("Real-Time Wavelet Filter for ECG / Biosignals")
+    plt.xlabel("Time (seconds)")
+    plt.ylabel("Amplitude")
+    plt.grid(True, alpha=0.25)
+    plt.legend(loc="upper right")
+    plt.tight_layout()
+    plt.savefig(plot_path, dpi=160)
+    plt.close()
+
+
+def compute_metrics(
+    raw_signal: np.ndarray,
+    filtered_signal: np.ndarray,
+    reference_signal: Optional[np.ndarray],
+) -> dict[str, float]:
+    metrics = {
+        "raw_rms": rms(raw_signal),
+        "filtered_rms": rms(filtered_signal),
+    }
+
+    if reference_signal is not None:
+        raw_error = raw_signal - reference_signal
+        filtered_error = filtered_signal - reference_signal
+        metrics["raw_rmse_vs_reference"] = rms(raw_error)
+        metrics["filtered_rmse_vs_reference"] = rms(filtered_error)
+        metrics["rmse_improvement_percent"] = 100.0 * (1.0 - metrics["filtered_rmse_vs_reference"] / max(metrics["raw_rmse_vs_reference"], EPSILON))
+
+    return metrics
+
+
+def rms(signal: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(signal))))
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Filter ECG/biosignal CSV data with streaming-style wavelet denoising.")
+    parser.add_argument("input_csv", type=Path, help="Input CSV with ECG/biosignal samples.")
+    parser.add_argument("output_csv", type=Path, help="Filtered output CSV.")
+    parser.add_argument("--sample-rate", type=float, default=None, help="Sample rate in Hz if no time column exists.")
+    parser.add_argument("--value-column", type=str, default=None, help="Column to filter. Defaults to an inferred ECG/signal column.")
+    parser.add_argument("--time-column", type=str, default=None, help="Time column in seconds.")
+    parser.add_argument("--reference-column", type=str, default=None, help="Optional clean/reference column for RMSE metrics.")
+    parser.add_argument("--wavelet", type=str, default="db6", help="PyWavelets wavelet name. Default: db6")
+    parser.add_argument("--level", type=int, default=5, help="DWT decomposition level.")
+    parser.add_argument("--window-seconds", type=float, default=2.0, help="Rolling real-time analysis window.")
+    parser.add_argument("--block-seconds", type=float, default=0.25, help="Streaming block size.")
+    parser.add_argument("--threshold-scale", type=float, default=0.85, help="Noise threshold multiplier.")
+    parser.add_argument("--threshold-mode", choices=["soft", "hard"], default="soft")
+    parser.add_argument("--no-baseline-correction", action="store_false", dest="baseline_correction")
+    parser.add_argument("--plot", type=Path, default=None, help="Optional PNG plot output.")
+    parser.set_defaults(baseline_correction=True)
+    return parser
+
+
+def validate_args(args: argparse.Namespace) -> None:
+    if args.sample_rate is not None and args.sample_rate <= 0:
+        raise ValueError("--sample-rate must be positive.")
+    if args.level < 1:
+        raise ValueError("--level must be at least 1.")
+    if args.window_seconds <= 0 or args.block_seconds <= 0:
+        raise ValueError("--window-seconds and --block-seconds must be positive.")
+    if args.threshold_scale < 0:
+        raise ValueError("--threshold-scale must be non-negative.")
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    validate_args(args)
+
+    data = load_biosignal_csv(args.input_csv, args.sample_rate, args.value_column, args.time_column)
+    settings = WaveletFilterSettings(
+        sample_rate=data.sample_rate,
+        wavelet=args.wavelet,
+        level=args.level,
+        window_seconds=args.window_seconds,
+        block_seconds=args.block_seconds,
+        threshold_scale=args.threshold_scale,
+        threshold_mode=args.threshold_mode,
+        baseline_correction=args.baseline_correction,
+    )
+
+    processor = RealTimeWaveletECGFilter(settings)
+    filtered_signal = processor.process_signal(data.signal)
+    write_output_csv(args.output_csv, data, filtered_signal)
+    maybe_write_plot(args.plot, data, filtered_signal, args.reference_column)
+
+    reference = data.columns.get(args.reference_column) if args.reference_column else None
+    metrics = compute_metrics(data.signal, filtered_signal, reference)
+    backend = "PyWavelets" if pywt is not None else "built-in Haar fallback"
+
+    print(f"Filtered CSV: {args.output_csv}")
+    print(f"Samples: {data.signal.size}")
+    print(f"Sample rate: {data.sample_rate:.2f} Hz")
+    print(f"Filtered column: {data.value_column}")
+    print(f"Wavelet backend: {backend}")
+    print(f"Window: {settings.window_samples} samples")
+    print(f"Block: {settings.block_samples} samples")
+
+    for key, value in metrics.items():
+        print(f"{key}: {value:.6f}")
+
+    if args.plot:
+        print(f"Plot: {args.plot}")
+
+
+if __name__ == "__main__":
+    main()
