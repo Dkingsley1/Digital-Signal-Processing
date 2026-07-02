@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""
+Guitar/Bass Amp Tone Capture Engine
+
+This compact portfolio prototype captures a reusable tone profile from a clean
+DI recording and a processed amp/cab target recording. The saved JSON profile can
+then be applied to another guitar or bass DI file.
+
+It is inspired by tone capture/profiling workflows, but it is intentionally a
+small DSP prototype rather than a commercial amp-modeling product.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+from dataclasses import dataclass
+from datetime import datetime
+from math import gcd
+from pathlib import Path
+
+import numpy as np
+from scipy.io import wavfile
+from scipy.signal import fftconvolve, resample_poly
+
+
+PROFILE_VERSION = "1.1"
+
+
+@dataclass(frozen=True)
+class CaptureConfig:
+    instrument: str = "guitar"
+    profile_name: str = "captured_tone"
+    ir_ms: float = 32.0
+    regularization: float = 0.002
+    search_bias: bool = True
+
+
+@dataclass(frozen=True)
+class CaptureResult:
+    profile: dict
+    reconstructed: np.ndarray
+    aligned_di: np.ndarray
+    aligned_target: np.ndarray
+    match_rmse: float
+    match_correlation: float
+    spectral_error_db: float
+
+
+def read_wav_float(path: Path) -> tuple[int, np.ndarray]:
+    """Read a WAV file and return mono float audio in [-1, 1]."""
+    sample_rate, data = wavfile.read(path)
+
+    if data.ndim == 2:
+        data = np.mean(data, axis=1)
+
+    if np.issubdtype(data.dtype, np.integer):
+        max_abs = float(np.iinfo(data.dtype).max)
+        audio = data.astype(np.float64) / max_abs
+    else:
+        audio = data.astype(np.float64)
+
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    return int(sample_rate), np.clip(audio, -1.0, 1.0)
+
+
+def write_wav_float(path: Path, sample_rate: int, audio: np.ndarray) -> None:
+    """Write float audio as a 16-bit WAV file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    audio = np.nan_to_num(audio, nan=0.0, posinf=0.0, neginf=0.0)
+    audio = soft_limiter(audio)
+    wavfile.write(path, sample_rate, np.int16(np.clip(audio, -1.0, 1.0) * 32767))
+
+
+def resample_if_needed(audio: np.ndarray, source_rate: int, target_rate: int) -> np.ndarray:
+    if source_rate == target_rate:
+        return audio
+
+    factor = gcd(source_rate, target_rate)
+    up = target_rate // factor
+    down = source_rate // factor
+    return resample_poly(audio, up, down).astype(np.float64)
+
+
+def rms(audio: np.ndarray) -> float:
+    return float(np.sqrt(np.mean(np.square(audio)) + 1e-12))
+
+
+def normalize_peak(audio: np.ndarray, peak: float = 0.92) -> np.ndarray:
+    current_peak = float(np.max(np.abs(audio)) + 1e-12)
+    return audio * min(1.0, peak / current_peak)
+
+
+def remove_dc(audio: np.ndarray) -> np.ndarray:
+    return audio - float(np.mean(audio))
+
+
+def soft_limiter(audio: np.ndarray, ceiling: float = 0.98) -> np.ndarray:
+    """Prevent clipping while keeping the level practical for listening."""
+    audio = remove_dc(audio)
+    peak = float(np.max(np.abs(audio)) + 1e-12)
+    if peak <= ceiling:
+        return audio
+
+    scaled = audio / peak
+    limited = np.tanh(2.2 * scaled) / np.tanh(2.2)
+    return limited * ceiling
+
+
+def align_pair(di_audio: np.ndarray, target_audio: np.ndarray, max_lag_s: float, sample_rate: int) -> tuple[np.ndarray, np.ndarray, int]:
+    """Align target audio to DI using short cross-correlation."""
+    compare_len = min(len(di_audio), len(target_audio), int(sample_rate * 8.0))
+    if compare_len < sample_rate // 2:
+        min_len = min(len(di_audio), len(target_audio))
+        return di_audio[:min_len], target_audio[:min_len], 0
+
+    di_ref = remove_dc(di_audio[:compare_len])
+    target_ref = remove_dc(target_audio[:compare_len])
+    max_lag = int(round(max_lag_s * sample_rate))
+
+    corr = np.correlate(target_ref, di_ref, mode="full")
+    center = len(di_ref) - 1
+    start = max(0, center - max_lag)
+    end = min(len(corr), center + max_lag + 1)
+    lag = int(np.argmax(corr[start:end]) + start - center)
+
+    if lag > 0:
+        target_aligned = target_audio[lag:]
+        di_aligned = di_audio[: len(target_aligned)]
+    elif lag < 0:
+        di_aligned = di_audio[-lag:]
+        target_aligned = target_audio[: len(di_aligned)]
+    else:
+        min_len = min(len(di_audio), len(target_audio))
+        di_aligned = di_audio[:min_len]
+        target_aligned = target_audio[:min_len]
+
+    min_len = min(len(di_aligned), len(target_aligned))
+    return di_aligned[:min_len], target_aligned[:min_len], lag
+
+
+def envelope_follower(
+    audio: np.ndarray,
+    sample_rate: int,
+    attack_ms: float = 4.0,
+    release_ms: float = 85.0,
+) -> np.ndarray:
+    """Track playing intensity for level-dependent nonlinear behavior."""
+    attack_coeff = np.exp(-1.0 / max(1.0, sample_rate * attack_ms / 1000.0))
+    release_coeff = np.exp(-1.0 / max(1.0, sample_rate * release_ms / 1000.0))
+    magnitude = np.abs(audio)
+    envelope = np.zeros_like(audio, dtype=np.float64)
+
+    for index, sample in enumerate(magnitude):
+        previous = envelope[index - 1] if index else 0.0
+        coeff = attack_coeff if sample > previous else release_coeff
+        envelope[index] = coeff * previous + (1.0 - coeff) * sample
+
+    return envelope
+
+
+def apply_saturation(audio: np.ndarray, drive: float, bias: float) -> np.ndarray:
+    """Apply a static asymmetric tanh saturation model."""
+    driven = drive * (audio + bias)
+    centered = np.tanh(driven) - np.tanh(drive * bias)
+    normalizer = float(np.max(np.abs(centered)) + 1e-12)
+    return centered / normalizer
+
+
+def apply_dynamic_nonlinearity(
+    audio: np.ndarray,
+    sample_rate: int,
+    input_gain: float,
+    drive: float,
+    bias: float,
+    sag: float,
+    compression: float,
+) -> np.ndarray:
+    """
+    Apply level-dependent amp-style nonlinearity.
+
+    The envelope follower makes hard playing reduce effective drive and output
+    gain slightly, approximating sag/compression in a compact prototype form.
+    """
+    gained = audio * input_gain
+    envelope = envelope_follower(gained, sample_rate)
+    normalized_env = envelope / (float(np.percentile(envelope, 99.0)) + 1e-12)
+    normalized_env = np.clip(normalized_env, 0.0, 2.5)
+
+    sag_gain = 1.0 / (1.0 + sag * normalized_env)
+    dynamic_drive = drive / (1.0 + 0.65 * sag * normalized_env)
+    driven = dynamic_drive * ((gained * sag_gain) + bias)
+    centered = np.tanh(driven) - np.tanh(dynamic_drive * bias)
+
+    compression_gain = 1.0 / (1.0 + compression * normalized_env)
+    processed = centered * compression_gain
+    normalizer = float(np.max(np.abs(processed)) + 1e-12)
+    return processed / normalizer
+
+
+def next_power_of_two(value: int) -> int:
+    return 1 << (value - 1).bit_length()
+
+
+def estimate_ir_regularized(
+    source: np.ndarray,
+    target: np.ndarray,
+    ir_samples: int,
+    regularization: float,
+) -> np.ndarray:
+    """
+    Estimate a compact linear tone/cabinet impulse response by deconvolution.
+
+    H = Y * conj(X) / (|X|^2 + lambda)
+    """
+    nfft = next_power_of_two(len(source) + ir_samples - 1)
+    source_fft = np.fft.rfft(source, nfft)
+    target_fft = np.fft.rfft(target, nfft)
+    denom = np.abs(source_fft) ** 2
+    reg = regularization * float(np.max(denom) + 1e-12)
+    transfer = target_fft * np.conj(source_fft) / (denom + reg)
+    impulse = np.fft.irfft(transfer, nfft)[:ir_samples]
+
+    window = np.hanning(ir_samples * 2)[ir_samples:]
+    impulse *= window
+    impulse = remove_dc(impulse)
+    impulse /= float(np.max(np.abs(impulse)) + 1e-12)
+    impulse *= 0.75
+    return impulse.astype(np.float64)
+
+
+def estimate_gain(source: np.ndarray, target: np.ndarray) -> float:
+    denom = float(np.dot(source, source) + 1e-12)
+    return float(np.dot(target, source) / denom)
+
+
+def spectral_magnitude(audio: np.ndarray, sample_rate: int, bins: int = 512) -> tuple[np.ndarray, np.ndarray]:
+    n = min(len(audio), sample_rate * 8)
+    if n < 1024:
+        n = len(audio)
+
+    window = np.hanning(n)
+    spectrum = np.fft.rfft(remove_dc(audio[:n]) * window)
+    magnitude_db = 20.0 * np.log10(np.abs(spectrum) + 1e-9)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+
+    if len(freqs) <= bins:
+        return freqs, magnitude_db
+
+    target_freqs = np.geomspace(max(20.0, freqs[1]), sample_rate / 2.0, bins)
+    interp = np.interp(target_freqs, freqs, magnitude_db)
+    return target_freqs, interp
+
+
+def spectral_error_db(reference: np.ndarray, candidate: np.ndarray, sample_rate: int) -> float:
+    _, ref_mag = spectral_magnitude(reference, sample_rate)
+    _, cand_mag = spectral_magnitude(candidate, sample_rate)
+    ref_mag -= float(np.mean(ref_mag))
+    cand_mag -= float(np.mean(cand_mag))
+    return float(np.sqrt(np.mean((ref_mag - cand_mag) ** 2)))
+
+
+def correlation(a: np.ndarray, b: np.ndarray) -> float:
+    a = remove_dc(a)
+    b = remove_dc(b)
+    return float(np.dot(a, b) / ((np.linalg.norm(a) * np.linalg.norm(b)) + 1e-12))
+
+
+def band_energy(audio: np.ndarray, sample_rate: int, low_hz: float, high_hz: float) -> float:
+    n = min(len(audio), sample_rate * 8)
+    spectrum = np.fft.rfft(remove_dc(audio[:n]) * np.hanning(n))
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    mask = (freqs >= low_hz) & (freqs <= high_hz)
+    if not np.any(mask):
+        return 0.0
+    return float(np.mean(np.abs(spectrum[mask]) ** 2))
+
+
+def tone_features(audio: np.ndarray, sample_rate: int) -> dict[str, float]:
+    low = band_energy(audio, sample_rate, 60.0, 250.0)
+    mid = band_energy(audio, sample_rate, 250.0, 1800.0)
+    high = band_energy(audio, sample_rate, 1800.0, 8000.0)
+    total = low + mid + high + 1e-12
+
+    freqs, mag = spectral_magnitude(audio, sample_rate)
+    linear_mag = 10.0 ** (mag / 20.0)
+    centroid = float(np.sum(freqs * linear_mag) / (np.sum(linear_mag) + 1e-12))
+
+    return {
+        "rms": rms(audio),
+        "peak": float(np.max(np.abs(audio)) + 1e-12),
+        "crest_factor": float((np.max(np.abs(audio)) + 1e-12) / (rms(audio) + 1e-12)),
+        "spectral_centroid_hz": centroid,
+        "low_energy_ratio": low / total,
+        "mid_energy_ratio": mid / total,
+        "high_energy_ratio": high / total,
+    }
+
+
+def apply_profile_to_audio(audio: np.ndarray, sample_rate: int, profile: dict) -> np.ndarray:
+    profile_rate = int(profile["sample_rate_hz"])
+    audio = resample_if_needed(audio, sample_rate, profile_rate)
+
+    nonlinear = profile["nonlinear"]
+    cabinet = profile["cabinet"]
+    driven = apply_dynamic_nonlinearity(
+        audio,
+        profile_rate,
+        input_gain=float(nonlinear["input_gain"]),
+        drive=float(nonlinear["drive"]),
+        bias=float(nonlinear["bias"]),
+        sag=float(nonlinear.get("sag", 0.0)),
+        compression=float(nonlinear.get("compression", 0.0)),
+    )
+    ir = np.array(cabinet["impulse_response"], dtype=np.float64)
+    filtered = fftconvolve(driven, ir, mode="full")[: len(driven)]
+    output = filtered * float(profile["output_gain"])
+    return normalize_peak(soft_limiter(output), peak=0.92)
+
+
+def capture_tone_profile(
+    di_audio: np.ndarray,
+    target_audio: np.ndarray,
+    sample_rate: int,
+    config: CaptureConfig,
+    di_source_name: str,
+    target_source_name: str,
+) -> CaptureResult:
+    """Capture a reusable tone profile from aligned DI and amp target audio."""
+    di_audio = normalize_peak(remove_dc(di_audio), peak=0.95)
+    target_audio = normalize_peak(remove_dc(target_audio), peak=0.95)
+    di_aligned, target_aligned, lag = align_pair(di_audio, target_audio, max_lag_s=0.05, sample_rate=sample_rate)
+
+    ir_samples = max(128, int(round((config.ir_ms / 1000.0) * sample_rate)))
+    input_gain = float(np.clip(rms(target_aligned) / (rms(di_aligned) + 1e-12), 0.35, 8.0))
+
+    drive_values = np.array([0.85, 1.15, 1.55, 2.1, 2.8, 3.8, 5.1, 6.8, 9.0], dtype=np.float64)
+    bias_values = np.array([-0.055, 0.0, 0.055], dtype=np.float64) if config.search_bias else np.array([0.0])
+
+    best: dict | None = None
+    best_dynamic: dict | None = None
+
+    def evaluate_candidate(drive: float, bias: float, sag: float, compression: float) -> None:
+        nonlocal best, best_dynamic
+        nonlinear_source = apply_dynamic_nonlinearity(
+            di_aligned,
+            sample_rate,
+            input_gain=input_gain,
+            drive=drive,
+            bias=bias,
+            sag=sag,
+            compression=compression,
+        )
+        impulse = estimate_ir_regularized(
+            nonlinear_source,
+            target_aligned,
+            ir_samples=ir_samples,
+            regularization=config.regularization,
+        )
+        reconstructed = fftconvolve(nonlinear_source, impulse, mode="full")[: len(target_aligned)]
+        output_gain = estimate_gain(reconstructed, target_aligned)
+        reconstructed *= output_gain
+
+        time_error = rms(target_aligned - reconstructed)
+        spec_error = spectral_error_db(target_aligned, reconstructed, sample_rate)
+        score = time_error + 0.015 * spec_error
+
+        candidate = {
+            "score": score,
+            "drive": float(drive),
+            "bias": float(bias),
+            "sag": float(sag),
+            "compression": float(compression),
+            "impulse": impulse,
+            "output_gain": float(output_gain),
+            "reconstructed": reconstructed,
+            "time_error": float(time_error),
+            "spectral_error_db": float(spec_error),
+            "selection_note": "lowest_error_candidate",
+        }
+
+        if best is None or score < best["score"]:
+            best = candidate
+
+        if (sag > 0.0 or compression > 0.0) and (best_dynamic is None or score < best_dynamic["score"]):
+            best_dynamic = candidate | {"selection_note": "dynamic_candidate_within_tolerance"}
+
+    for drive in drive_values:
+        for bias in bias_values:
+            evaluate_candidate(float(drive), float(bias), sag=0.0, compression=0.0)
+
+    assert best is not None
+    refined_drives = sorted({float(best["drive"]), float(min(9.0, best["drive"] * 1.35))})
+    refined_biases = sorted({float(best["bias"]), 0.0})
+    for drive in refined_drives:
+        for bias in refined_biases:
+            for sag in [0.28, 0.48]:
+                for compression in [0.42, 0.65]:
+                    evaluate_candidate(drive, bias, sag=sag, compression=compression)
+
+    assert best is not None
+    if best_dynamic is not None and best_dynamic["score"] <= best["score"] * 1.18:
+        best = best_dynamic
+
+    reconstructed = normalize_peak(best["reconstructed"], peak=0.92)
+    match_rmse = rms(target_aligned - reconstructed)
+    match_corr = correlation(target_aligned, reconstructed)
+    match_spec = spectral_error_db(target_aligned, reconstructed, sample_rate)
+
+    profile = {
+        "profile_version": PROFILE_VERSION,
+        "name": config.profile_name,
+        "instrument": config.instrument,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "sample_rate_hz": int(sample_rate),
+        "capture_sources": {
+            "di": di_source_name,
+            "target": target_source_name,
+            "alignment_lag_samples": int(lag),
+        },
+        "nonlinear": {
+            "model": "dynamic_asymmetric_tanh",
+            "input_gain": float(input_gain),
+            "drive": float(best["drive"]),
+            "bias": float(best["bias"]),
+            "sag": float(best["sag"]),
+            "compression": float(best["compression"]),
+            "envelope_follower": {
+                "attack_ms": 4.0,
+                "release_ms": 85.0,
+            },
+            "selection_note": str(best["selection_note"]),
+        },
+        "cabinet": {
+            "model": "regularized_deconvolution_fir",
+            "ir_samples": int(len(best["impulse"])),
+            "ir_ms": float(len(best["impulse"]) * 1000.0 / sample_rate),
+            "regularization": float(config.regularization),
+            "impulse_response": [round(float(value), 9) for value in best["impulse"]],
+        },
+        "output_gain": float(best["output_gain"]),
+        "tone_features": {
+            "di": tone_features(di_aligned, sample_rate),
+            "target": tone_features(target_aligned, sample_rate),
+            "profiled": tone_features(reconstructed, sample_rate),
+        },
+        "validation": {
+            "match_rmse": float(match_rmse),
+            "match_correlation": float(match_corr),
+            "spectral_error_db": float(match_spec),
+        },
+        "portfolio_note": "Prototype tone capture/profile system, not a commercial amp modeling product.",
+    }
+
+    return CaptureResult(
+        profile=profile,
+        reconstructed=reconstructed,
+        aligned_di=di_aligned,
+        aligned_target=target_aligned,
+        match_rmse=float(match_rmse),
+        match_correlation=float(match_corr),
+        spectral_error_db=float(match_spec),
+    )
+
+
+def save_profile(path: Path, profile: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+
+
+def load_profile(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def fft_tone_filter(audio: np.ndarray, sample_rate: int, points: list[tuple[float, float]]) -> np.ndarray:
+    """Apply a simple interpolated frequency response in dB."""
+    n = len(audio)
+    freqs = np.fft.rfftfreq(n, d=1.0 / sample_rate)
+    spectrum = np.fft.rfft(audio)
+
+    point_freqs = np.array([point[0] for point in points], dtype=np.float64)
+    point_db = np.array([point[1] for point in points], dtype=np.float64)
+    gain_db = np.interp(freqs, point_freqs, point_db, left=point_db[0], right=point_db[-1])
+    gain = 10.0 ** (gain_db / 20.0)
+    return np.fft.irfft(spectrum * gain, n=n).astype(np.float64)
+
+
+def synthesize_plucked_riff(
+    sample_rate: int,
+    duration_s: float,
+    instrument: str,
+    seed: int,
+    variant: int = 0,
+) -> np.ndarray:
+    """Create a synthetic DI-style guitar or bass riff for the demo."""
+    rng = np.random.default_rng(seed)
+    sample_count = int(round(sample_rate * duration_s))
+    audio = np.zeros(sample_count, dtype=np.float64)
+
+    if instrument == "bass":
+        base_notes = [41.2, 55.0, 61.7, 73.4, 82.4, 73.4, 61.7, 55.0]
+        note_gap_s = 0.58
+        decay_s = 0.82
+        harmonic_count = 8
+    else:
+        base_notes = [82.4, 110.0, 146.8, 196.0, 246.9, 196.0, 146.8, 110.0]
+        note_gap_s = 0.42
+        decay_s = 0.58
+        harmonic_count = 12
+
+    if variant:
+        base_notes = base_notes[2:] + base_notes[:2]
+
+    for note_index, frequency in enumerate(base_notes * 3):
+        start_s = 0.18 + note_index * note_gap_s
+        if start_s >= duration_s:
+            break
+
+        start = int(round(start_s * sample_rate))
+        length = min(sample_count - start, int(round(sample_rate * (note_gap_s + decay_s))))
+        if length <= 0:
+            continue
+
+        local_t = np.arange(length, dtype=np.float64) / sample_rate
+        envelope = np.exp(-local_t / decay_s)
+        pick = rng.normal(0.0, 0.05 if instrument == "guitar" else 0.035, length) * np.exp(-local_t / 0.018)
+        note = pick
+
+        for harmonic in range(1, harmonic_count + 1):
+            harmonic_amp = 1.0 / (harmonic ** (1.08 if instrument == "guitar" else 1.25))
+            detune = 1.0 + rng.normal(0.0, 0.00045)
+            phase = rng.uniform(0.0, 2.0 * np.pi)
+            note += harmonic_amp * np.sin(2.0 * np.pi * frequency * harmonic * detune * local_t + phase)
+
+        note *= envelope
+        audio[start : start + length] += note
+
+    audio = fft_tone_filter(
+        audio,
+        sample_rate,
+        points=[
+            (20.0, -10.0),
+            (70.0, -2.0 if instrument == "bass" else -5.0),
+            (180.0, 0.0),
+            (1200.0, -1.0),
+            (5500.0, -4.0 if instrument == "bass" else 1.5),
+            (12000.0, -18.0),
+            (sample_rate / 2.0, -30.0),
+        ],
+    )
+    return normalize_peak(audio, peak=0.72)
+
+
+def make_cabinet_ir(sample_rate: int, instrument: str) -> np.ndarray:
+    """Create a demo cabinet-like impulse response."""
+    ir_len = int(round(sample_rate * (0.040 if instrument == "guitar" else 0.055)))
+    t = np.arange(ir_len, dtype=np.float64) / sample_rate
+    rng = np.random.default_rng(88 if instrument == "guitar" else 144)
+
+    if instrument == "bass":
+        resonances = [(95.0, 1.0), (180.0, 0.45), (720.0, 0.16), (1800.0, 0.08)]
+        decay = np.exp(-t / 0.017)
+    else:
+        resonances = [(115.0, 0.35), (420.0, 0.50), (1250.0, 0.38), (3100.0, 0.25)]
+        decay = np.exp(-t / 0.011)
+
+    impulse = np.zeros(ir_len, dtype=np.float64)
+    impulse[0] = 1.0
+    for freq, amp in resonances:
+        impulse += amp * np.sin(2.0 * np.pi * freq * t + rng.uniform(0.0, np.pi)) * decay
+
+    for delay_ms, amp in [(1.2, -0.22), (2.7, 0.17), (5.4, -0.10), (9.5, 0.06)]:
+        index = int(round(delay_ms * sample_rate / 1000.0))
+        if index < ir_len:
+            impulse[index] += amp
+
+    impulse *= np.hanning(ir_len * 2)[ir_len:]
+    impulse = fft_tone_filter(
+        impulse,
+        sample_rate,
+        points=[
+            (20.0, -8.0 if instrument == "guitar" else -1.5),
+            (80.0, -3.0 if instrument == "guitar" else 2.5),
+            (250.0, 0.0),
+            (900.0, 1.5),
+            (3500.0, 0.5 if instrument == "guitar" else -6.0),
+            (6500.0, -14.0),
+            (sample_rate / 2.0, -42.0),
+        ],
+    )
+    impulse /= float(np.max(np.abs(impulse)) + 1e-12)
+    return impulse * 0.75
+
+
+def create_demo_amp_target(di_audio: np.ndarray, sample_rate: int, instrument: str) -> np.ndarray:
+    """Create a synthetic processed amp/cab target for demo capture."""
+    if instrument == "bass":
+        pre = fft_tone_filter(
+            di_audio,
+            sample_rate,
+            points=[(20.0, -6.0), (80.0, 2.5), (250.0, 1.0), (900.0, -1.5), (3500.0, -4.0), (sample_rate / 2.0, -35.0)],
+        )
+        saturated = apply_dynamic_nonlinearity(
+            pre,
+            sample_rate,
+            input_gain=2.1,
+            drive=2.6,
+            bias=-0.025,
+            sag=0.42,
+            compression=0.34,
+        )
+    else:
+        pre = fft_tone_filter(
+            di_audio,
+            sample_rate,
+            points=[(20.0, -18.0), (110.0, -4.0), (600.0, 1.5), (1600.0, 3.0), (4500.0, 1.0), (sample_rate / 2.0, -30.0)],
+        )
+        saturated = apply_dynamic_nonlinearity(
+            pre,
+            sample_rate,
+            input_gain=3.2,
+            drive=5.4,
+            bias=0.035,
+            sag=0.24,
+            compression=0.16,
+        )
+
+    cabinet_ir = make_cabinet_ir(sample_rate, instrument)
+    cabinet = fftconvolve(saturated, cabinet_ir, mode="full")[: len(saturated)]
+    room_hint = fftconvolve(cabinet, np.array([1.0, 0.0, 0.0, 0.08, -0.04]), mode="full")[: len(cabinet)]
+    return normalize_peak(room_hint, peak=0.78)
+
+
+def write_summary(path: Path, demo_results: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = [
+        "Guitar/Bass Amp Tone Capture Engine",
+        "",
+        "Pipeline:",
+        "1. Load a clean DI recording and a processed amp/cab target recording.",
+        "2. Align both recordings.",
+        "3. Search compact dynamic nonlinear saturation, sag, and compression behavior.",
+        "4. Estimate a cabinet/tone impulse response with regularized deconvolution.",
+        "5. Save the captured tone profile as JSON.",
+        "6. Apply the saved profile to another DI performance.",
+        "",
+        "Demo outputs:",
+    ]
+
+    for result in demo_results:
+        lines.extend(
+            [
+                f"- {result['instrument'].title()} profile: {result['profile_path']}",
+                f"  Captured target: {result['target_path']}",
+                f"  Profiled output: {result['profiled_path']}",
+                f"  Nonlinear model: drive={result['drive']:.2f}, sag={result['sag']:.2f}, compression={result['compression']:.2f}",
+                f"  Match correlation: {result['match_correlation']:.3f}",
+                f"  Spectral error: {result['spectral_error_db']:.2f} dB",
+            ]
+        )
+
+    lines.extend(
+        [
+            "",
+            "Important note:",
+            "This is a compact DSP portfolio prototype.",
+            "It is not a commercial neural amp modeler or hardware clone.",
+        ]
+    )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_capture_command(args: argparse.Namespace) -> None:
+    di_rate, di_audio = read_wav_float(args.di)
+    target_rate, target_audio = read_wav_float(args.target)
+    target_audio = resample_if_needed(target_audio, target_rate, di_rate)
+
+    config = CaptureConfig(
+        instrument=args.instrument,
+        profile_name=args.name,
+        ir_ms=args.ir_ms,
+        regularization=args.regularization,
+        search_bias=not args.no_bias_search,
+    )
+    result = capture_tone_profile(
+        di_audio,
+        target_audio,
+        sample_rate=di_rate,
+        config=config,
+        di_source_name=str(args.di),
+        target_source_name=str(args.target),
+    )
+    save_profile(args.profile, result.profile)
+
+    if args.reconstructed:
+        write_wav_float(args.reconstructed, di_rate, result.reconstructed)
+
+    print(f"Wrote profile: {args.profile}")
+    print(f"Match correlation: {result.match_correlation:.3f}")
+    print(f"Spectral error: {result.spectral_error_db:.2f} dB")
+
+
+def run_apply_command(args: argparse.Namespace) -> None:
+    sample_rate, audio = read_wav_float(args.input)
+    profile = load_profile(args.profile)
+    output = apply_profile_to_audio(audio, sample_rate, profile)
+    write_wav_float(args.output, int(profile["sample_rate_hz"]), output)
+    print(f"Wrote profiled audio: {args.output}")
+
+
+def run_demo_command(args: argparse.Namespace) -> None:
+    output_dir = args.output_dir
+    profiles_dir = output_dir / "profiles"
+    wav_dir = output_dir / "audio"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    sample_rate = args.sample_rate
+    demo_results: list[dict] = []
+
+    for instrument in ["guitar", "bass"]:
+        di = synthesize_plucked_riff(sample_rate, args.duration_s, instrument, seed=20 if instrument == "guitar" else 44)
+        target = create_demo_amp_target(di, sample_rate, instrument)
+        new_di = synthesize_plucked_riff(sample_rate, args.duration_s, instrument, seed=91 if instrument == "guitar" else 123, variant=1)
+
+        di_path = wav_dir / f"demo_{instrument}_clean_di.wav"
+        target_path = wav_dir / f"demo_{instrument}_amp_target.wav"
+        new_di_path = wav_dir / f"demo_{instrument}_new_di.wav"
+        reconstructed_path = wav_dir / f"demo_{instrument}_captured_match.wav"
+        profiled_path = wav_dir / f"demo_{instrument}_profiled_new_di.wav"
+        profile_path = profiles_dir / f"demo_{instrument}_tone_profile.json"
+
+        write_wav_float(di_path, sample_rate, di)
+        write_wav_float(target_path, sample_rate, target)
+        write_wav_float(new_di_path, sample_rate, new_di)
+
+        config = CaptureConfig(
+            instrument=instrument,
+            profile_name=f"demo_{instrument}_tone_profile",
+            ir_ms=96.0 if instrument == "bass" else 32.0,
+            regularization=0.002,
+        )
+        result = capture_tone_profile(
+            di,
+            target,
+            sample_rate=sample_rate,
+            config=config,
+            di_source_name=str(di_path),
+            target_source_name=str(target_path),
+        )
+        save_profile(profile_path, result.profile)
+        write_wav_float(reconstructed_path, sample_rate, result.reconstructed)
+
+        profiled_new = apply_profile_to_audio(new_di, sample_rate, result.profile)
+        write_wav_float(profiled_path, sample_rate, profiled_new)
+
+        demo_results.append(
+            {
+                "instrument": instrument,
+                "profile_path": profile_path,
+                "target_path": target_path,
+                "profiled_path": profiled_path,
+                "drive": float(result.profile["nonlinear"]["drive"]),
+                "sag": float(result.profile["nonlinear"]["sag"]),
+                "compression": float(result.profile["nonlinear"]["compression"]),
+                "match_correlation": result.match_correlation,
+                "spectral_error_db": result.spectral_error_db,
+            }
+        )
+
+    summary_path = output_dir / "tone_capture_summary.txt"
+    write_summary(summary_path, demo_results)
+
+    print("Tone capture demo complete.")
+    print(f"Summary: {summary_path}")
+    for result in demo_results:
+        print(
+            f"{result['instrument'].title()}: profile={result['profile_path']} "
+            f"profiled={result['profiled_path']} corr={result['match_correlation']:.3f}"
+        )
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Capture and apply guitar/bass amp tone profiles.")
+    subparsers = parser.add_subparsers(dest="command")
+
+    demo = subparsers.add_parser("demo", help="Generate synthetic DI/target audio and capture demo profiles.")
+    demo.add_argument("--output-dir", type=Path, default=Path("outputs"))
+    demo.add_argument("--sample-rate", type=int, default=44100)
+    demo.add_argument("--duration-s", type=float, default=5.8)
+    demo.set_defaults(func=run_demo_command)
+
+    capture = subparsers.add_parser("capture", help="Capture a tone profile from DI and target WAV files.")
+    capture.add_argument("--di", type=Path, required=True, help="Clean DI WAV file.")
+    capture.add_argument("--target", type=Path, required=True, help="Processed amp/cab target WAV file.")
+    capture.add_argument("--profile", type=Path, required=True, help="Output profile JSON path.")
+    capture.add_argument("--reconstructed", type=Path, default=None, help="Optional reconstructed match WAV output.")
+    capture.add_argument("--instrument", choices=["guitar", "bass"], default="guitar")
+    capture.add_argument("--name", default="captured_tone")
+    capture.add_argument("--ir-ms", type=float, default=32.0)
+    capture.add_argument("--regularization", type=float, default=0.002)
+    capture.add_argument("--no-bias-search", action="store_true")
+    capture.set_defaults(func=run_capture_command)
+
+    apply = subparsers.add_parser("apply", help="Apply a saved tone profile to a DI WAV file.")
+    apply.add_argument("--input", type=Path, required=True, help="Input DI WAV file.")
+    apply.add_argument("--profile", type=Path, required=True, help="Tone profile JSON path.")
+    apply.add_argument("--output", type=Path, required=True, help="Output profiled WAV path.")
+    apply.set_defaults(func=run_apply_command)
+
+    return parser
+
+
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+
+    if not hasattr(args, "func"):
+        args = parser.parse_args(["demo"])
+
+    args.func(args)
+
+
+if __name__ == "__main__":
+    main()
