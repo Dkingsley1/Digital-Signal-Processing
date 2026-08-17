@@ -1,0 +1,22 @@
+{
+  "Rhythm": {
+    "model_morph": 0.2,
+    "bass_db": 0.0,
+    "middle_db": 0.0,
+    "treble_db": 0.0,
+    "speaker_drive": 0.15,
+    "cone_cry": 0.04,
+    "output_trim_db": -3.0
+  },
+  "Lead": {
+    "model_morph": 0.65,
+    "middle_db": 1.5,
+    "speaker_drive": 0.25,
+    "cone_cry": 0.08,
+    "output_trim_db": -1.0
+  },
+  "Physical Cab": {
+    "destination": "power-amp-guitar-cab",
+    "output_trim_db": -6.0
+  }
+}

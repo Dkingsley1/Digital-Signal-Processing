@@ -1,0 +1,9 @@
+# Optional isolated research stack only. Never install this into the production
+# MLX interpreter. scripts/research_python.sh routes the capped VIDEO-drive venv.
+torch>=2.7
+auraloss[all]>=0.3
+neural-amp-modeler>=0.13
+nablafx>=1.0
+# NablAFx documents installing this with --no-deps because its old metadata pins
+# an obsolete Torch version. The isolated install follows that rule.
+rational-activations==0.2.0
