@@ -1,0 +1,5 @@
+matplotlib>=3.8
+pyqtgraph>=0.13
+PySide6>=6.7
+dearpygui>=2.0
+vispy>=0.14

@@ -1,0 +1,15 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="04 Tone System - Level Check" type="PythonConfigurationType" factoryName="Python">
+    <module name="guitar_bass_tone_capture_engine" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs><env name="PYTHONUNBUFFERED" value="1" /></envs>
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <option name="SCRIPT_NAME" value="$PROJECT_DIR$/tone_capture_engine.py" />
+    <option name="PARAMETERS" value="level-check --sample-rate 96000 --duration-s 8 --input-channels 2 --di-channel 1 --target-channel 2 --level-profile aggressive --di-box &quot;Livewire SPDI passive direct box&quot; --mic &quot;Shure SM57&quot; --amp &quot;Peavey 6505 Mini Head&quot; --cabinet &quot;Egnater Tweaker 1x12 Celestion&quot;" />
+    <option name="EMULATE_TERMINAL" value="true" />
+    <method v="2" />
+  </configuration>
+</component>

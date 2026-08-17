@@ -1,0 +1,15 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="03 Tone System - Audio Devices" type="PythonConfigurationType" factoryName="Python">
+    <module name="guitar_bass_tone_capture_engine" />
+    <option name="PARENT_ENVS" value="true" />
+    <envs><env name="PYTHONUNBUFFERED" value="1" /></envs>
+    <option name="WORKING_DIRECTORY" value="$PROJECT_DIR$" />
+    <option name="IS_MODULE_SDK" value="true" />
+    <option name="ADD_CONTENT_ROOTS" value="true" />
+    <option name="ADD_SOURCE_ROOTS" value="true" />
+    <option name="SCRIPT_NAME" value="$PROJECT_DIR$/tone_capture_engine.py" />
+    <option name="PARAMETERS" value="devices" />
+    <option name="EMULATE_TERMINAL" value="true" />
+    <method v="2" />
+  </configuration>
+</component>

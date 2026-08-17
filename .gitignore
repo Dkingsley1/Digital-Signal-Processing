@@ -12,3 +12,8 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Keep the portable PyCharm launchers for the guitar tone-capture project.
+!Guitar/guitar_bass_tone_capture_engine/.idea/
+!Guitar/guitar_bass_tone_capture_engine/.idea/runConfigurations/
+!Guitar/guitar_bass_tone_capture_engine/.idea/runConfigurations/*.xml

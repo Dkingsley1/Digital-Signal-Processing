@@ -1,0 +1,16 @@
+-r requirements-live.txt
+-r requirements-mlx.txt
+
+# Higher-quality file I/O and resampling. The code falls back to SciPy if these
+# are not installed.
+soundfile>=0.13
+soxr>=0.5
+
+# Analysis/diagnostic libraries for future dataset scoring and loudness checks.
+librosa>=0.11
+pyloudnorm>=0.2
+noisereduce>=3.0.3
+scikit-learn>=1.5
+
+# Useful for offline augmentation/reamp references and future plugin-based tests.
+pedalboard>=0.9
